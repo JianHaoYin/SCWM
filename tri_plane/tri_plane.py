@@ -9,11 +9,11 @@
 # its affiliates is strictly prohibited.
 
 import torch
-from torch_utils import persistence
-from training.networks_stylegan2 import Generator as StyleGAN2Backbone
-from training.volumetric_rendering.renderer import ImportanceRenderer
-from training.volumetric_rendering.ray_sampler import RaySampler
-import dnnlib
+import torch.nn as nn
+import torch.nn.functional as F
+from torchvision import transforms,models
+import models
+
 
 @persistence.persistent_class
 class TriPlaneGenerator(torch.nn.Module):
@@ -105,6 +105,131 @@ class TriPlaneGenerator(torch.nn.Module):
         # Render a batch of generated images.
         ws = self.mapping(z, c, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
         return self.synthesis(ws, c, update_emas=update_emas, neural_rendering_resolution=neural_rendering_resolution, cache_backbone=cache_backbone, use_cached_backbone=use_cached_backbone, **synthesis_kwargs)
+
+class TriPlaneModel(nn.Module):
+    """
+    Core functionality:
+    1. Initialize Tri-Plane using satellite image (XY plane uses satellite features, XZ/YZ initialized to 0)
+    2. Optimize Tri-Plane features by Cross-View Hybrid Attention(CVHA)
+    3. Update Tri-Plane planes (XY/XZ/YZ) with new images and camera parameters by ICA
+    4. Output pure Tri-Plane features, shape [B, 3, 32, H, W]
+    """
+    def __init__(
+        self, 
+        satellite_img: torch.Tensor,  # input satellite image [B, 3, H, W]
+        plane_resolution: tuple = 224,      # Tri-Plane resolution (H, W)
+        plane_channel: int = 32,      # channels per plane
+        device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    ):
+        super().__init__()
+        self.satellite_img = satellite_img
+        self.device = device
+        self.plane_channel = plane_channel
+        self.num_planes = 3                   # 3 plane：XY/XZ/YZ
+        self.plane_h, self.plane_w = plane_resolution  # Tri-Plane resolution
+
+        # initialize ResNet50 for satellite image feature extraction
+        self.satellite_feature_extractor = self._build_satellite_feature_extractor()
+        
+        
+        # 3. 相机参数编码器：将相机参数→三个平面的更新权重（无渲染逻辑，仅编码权重）
+        # 相机参数维度可自定义（如输入12维外参+4维内参=16维）
+        self.cam_encoder = nn.Sequential(
+            nn.Linear(16, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, self.num_planes),
+            nn.Softmax(dim=-1)  # 权重和为1，控制各平面更新幅度
+        ).to(self.device)
+        
+        # initialize Tri-Plane
+        self.tri_plane = self._init_tri_plane(satellite_img)
+
+    def _build_satellite_feature_extractor(self):
+        resnet = models.resnet50(pretrained=True)
+        # get the output of layer4
+        feature_extractor = nn.Sequential(*list(resnet.children())[:-2])
+        # frozen parameters
+        for param in feature_extractor.parameters():
+            param.requires_grad = False
+        feature_extractor.eval()
+        return feature_extractor.to(self.device)
+
+    def _init_tri_plane(self, satellite_img):
+        """
+        仅从卫星图初始化Tri-Plane：
+        - XY平面：卫星图的ResNet特征投影后填充
+        - XZ/YZ平面：初始化为0（后续通过update更新）
+        """
+        # 图片预处理（适配ResNet输入）
+        preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),  # ResNet标准输入尺寸
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        img_input = preprocess(satellite_img).to(self.device)
+
+        # 提取2048维全局特征（无梯度）
+        with torch.no_grad():
+            img_feat = self.feature_extractor(img_input)  # [B, 2048, 1, 1]
+            img_feat = torch.flatten(img_feat, 1)         # [B, 2048]
+        
+        # 投影到32维，扩展为Tri-Plane分辨率
+        xy_feat = self.feature_projector(img_feat)  # [B, 32]
+        xy_feat = xy_feat.unsqueeze(-1).unsqueeze(-1)  # [B, 32, 1, 1]
+        xy_feat = xy_feat.expand(-1, self.plane_channel, self.plane_h, self.plane_w)  # [B,32,H,W]
+
+        # XZ/YZ平面初始化为0
+        xz_feat = torch.zeros_like(xy_feat)
+        yz_feat = torch.zeros_like(xy_feat)
+
+        # 组合为Tri-Plane：[B, 3(planes), 32(ch), H, W]
+        tri_plane = torch.cat([xy_feat, xz_feat, yz_feat], dim=1)
+        tri_plane = tri_plane.view(-1, self.num_planes, self.plane_channel, self.plane_h, self.plane_w)
+        
+        # 转为可训练参数（仅用于更新，无渲染依赖）
+        return nn.Parameter(tri_plane, requires_grad=True)
+
+    def forward(self):
+        """前向传播：仅返回当前的Tri-Plane，无任何渲染/射线逻辑"""
+        return self.tri_plane
+
+    def update(self, new_img: torch.Tensor, new_cam_param: torch.Tensor, lr: float = 0.05):
+        """
+        仅更新Tri-Plane，不涉及任何渲染：
+        :param new_img: 新输入图片 [B, 3, H_img, W_img]
+        :param new_cam_param: 新图片的相机参数 [B, 16]（自定义维度，无渲染耦合）
+        :param lr: 更新步长，控制特征更新幅度
+        """
+        # 1. 提取新图片的32维特征
+        preprocess = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        new_img_input = preprocess(new_img).to(self.device)
+        
+        with torch.no_grad():
+            new_img_feat = self.feature_extractor(new_img_input)
+            new_img_feat = torch.flatten(new_img_feat, 1)
+        new_plane_feat = self.feature_projector(new_img_feat)  # [B, 32]
+        new_plane_feat = new_plane_feat.unsqueeze(-1).unsqueeze(-1)
+        new_plane_feat = new_plane_feat.expand(-1, self.plane_channel, self.plane_h, self.plane_w)  # [B,32,H,W]
+
+        # 2. 编码相机参数，得到三个平面的更新权重
+        cam_weights = self.cam_encoder(new_cam_param)  # [B, 3]
+
+        # 3. 计算每个平面的更新增量（按相机权重分配新特征）
+        update_delta = torch.zeros_like(self.tri_plane)
+        for i in range(self.num_planes):
+            # 权重广播到Tri-Plane形状：[B, 1, 1, 1, 1] → [B, 1, 32, H, W]
+            weight = cam_weights[:, i].unsqueeze(1).unsqueeze(2).unsqueeze(3).unsqueeze(4)
+            update_delta[:, i, :, :, :] = weight * new_plane_feat
+
+        # 4. 无梯度更新Tri-Plane（仅参数更新，无反向传播/渲染）
+        with torch.no_grad():
+            self.tri_plane.data = self.tri_plane.data + lr * update_delta
+
+        # 返回更新后的Tri-Plane
+        return self.tri_plane
+
 
 
 from training.networks_stylegan2 import FullyConnectedLayer
