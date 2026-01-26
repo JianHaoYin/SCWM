@@ -1,23 +1,12 @@
-
 from .multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32
-from mmcv.ops.multi_scale_deform_attn import multi_scale_deformable_attn_pytorch
 import warnings
 import torch
 import torch.nn as nn
-from mmcv.cnn import xavier_init, constant_init
-from mmcv.cnn.bricks.registry import ATTENTION
 import math
-from mmcv.runner.base_module import BaseModule
-
-from mmcv.utils import ext_loader
-ext_module = ext_loader.load_ext(
-    '_ext', ['ms_deform_attn_backward', 'ms_deform_attn_forward'])
 
 
-@ATTENTION.register_module()
-class TPVCrossViewHybridAttention(BaseModule):
-    """Cross view hybrid attention module used in TPVFormer.
-    Based on deformable attention.
+class CrossViewHybridAttention(nn.Module):
+    """Cross view hybrid attention module. Based on deformable attention.
 
     Args:
         embed_dims (int): The embedding dimension of Attention.
@@ -31,7 +20,7 @@ class TPVCrossViewHybridAttention(BaseModule):
             Default: 64.
         dropout (float): A Dropout layer on `inp_identity`.
             Default: 0.1.
-        batch_first (bool): Key, Query and Value are shape of
+         (bool): Key, Query and Value are shape of
             (batch, n, embed_dim)
             or (n, batch, embed_dim). Default to True.
         norm_cfg (dict): Config dict for normalization layer.
@@ -47,6 +36,7 @@ class TPVCrossViewHybridAttention(BaseModule):
                  num_points=4,
                  im2col_step=64,
                  dropout=0.1,
+                 deformable_attention=None,
                  batch_first=True,
                  norm_cfg=None,
                  init_cfg=None,
@@ -61,7 +51,7 @@ class TPVCrossViewHybridAttention(BaseModule):
         self.dropout = nn.Dropout(dropout)
         self.batch_first = batch_first
         self.fp16_enabled = False
-
+        self.deformable_attention = deformable_attention
         # you'd better set dim_per_head to a power of 2
         # which is more efficient in the CUDA implementation
         def _is_power_of_2(n):
@@ -92,25 +82,41 @@ class TPVCrossViewHybridAttention(BaseModule):
         self.output_proj = nn.Linear(embed_dims, embed_dims)
         self.init_weights()
 
+
+
     def init_weights(self):
-        """Default initialization for Parameters of Module."""
-        constant_init(self.sampling_offsets, 0.)
+        '''Default initialization for Parameters of Module (PyTorch原生实现).'''
+        # init sampling_offesets
+        nn.init.constant_(self.sampling_offsets.weight, 0.)
+        
+        # 
         thetas = torch.arange(
             self.num_heads,
             dtype=torch.float32) * (2.0 * math.pi / self.num_heads)
         grid_init = torch.stack([thetas.cos(), thetas.sin()], -1)
-        grid_init = (grid_init /
-                     grid_init.abs().max(-1, keepdim=True)[0]).view(
-            self.num_heads, 1, 1,
-            2).repeat(1, self.num_levels*self.num_tpv_queue, self.num_points, 1)
-
+        # 
+        grid_init = (grid_init / grid_init.abs().max(-1, keepdim=True)[0])
+        # (num_heads, 1, 1, 2) -> (num_heads, num_levels*num_tpv_queue, num_points, 2)
+        grid_init = grid_init.view(self.num_heads, 1, 1, 2).repeat(
+            1, self.num_levels * self.num_tpv_queue, self.num_points, 1)
+        # 
         for i in range(self.num_points):
             grid_init[:, :, i, :] *= i + 1
-
+        # 
         self.sampling_offsets.bias.data = grid_init.view(-1)
-        constant_init(self.attention_weights, val=0., bias=0.)
-        xavier_init(self.value_proj, distribution='uniform', bias=0.)
-        xavier_init(self.output_proj, distribution='uniform', bias=0.)
+        
+        # 
+        nn.init.constant_(self.attention_weights.weight, 0.)
+        nn.init.constant_(self.attention_weights.bias, 0.)
+        
+
+        nn.init.xavier_uniform_(self.value_proj.weight, gain=1.0)
+        nn.init.constant_(self.value_proj.bias, 0.)
+        
+        # 
+        nn.init.xavier_uniform_(self.output_proj.weight, gain=1.0)
+        nn.init.constant_(self.output_proj.bias, 0.)
+        
         self._is_init = True
 
     def forward(self,
@@ -224,7 +230,7 @@ class TPVCrossViewHybridAttention(BaseModule):
                 value, spatial_shapes, level_start_index, sampling_locations,
                 attention_weights, self.im2col_step)
         else:
-            output = multi_scale_deformable_attn_pytorch(
+            output = self.deformable_attention(
                 value, spatial_shapes, sampling_locations, attention_weights)
         # output shape (bs*num_tpv_queue, num_query, embed_dims)
         # (bs*num_tpv_queue, num_query, embed_dims)-> (num_query, embed_dims, bs*num_tpv_queue)
@@ -242,4 +248,73 @@ class TPVCrossViewHybridAttention(BaseModule):
         if not self.batch_first:
             output = output.permute(1, 0, 2)
 
-        return self.dropout(output) + identity
+        return self.dropout(output) + identity # （bs, num_query, embed_dims）
+    
+    @staticmethod
+    def get_cross_view_ref_points(tpv_h, tpv_w, tpv_z, num_points_in_pillar):
+        # ref points generating target: (#query)hw+zh+wz, (#level)3, #p, 2
+        # generate points for hw and level 1
+        h_ranges = torch.linspace(0.5, tpv_h-0.5, tpv_h) / tpv_h
+        w_ranges = torch.linspace(0.5, tpv_w-0.5, tpv_w) / tpv_w
+        h_ranges = h_ranges.unsqueeze(-1).expand(-1, tpv_w).flatten()
+        w_ranges = w_ranges.unsqueeze(0).expand(tpv_h, -1).flatten()
+        hw_hw = torch.stack([w_ranges, h_ranges], dim=-1) # hw, 2
+        hw_hw = hw_hw.unsqueeze(1).expand(-1, num_points_in_pillar[2], -1) # hw, #p, 2
+        # generate points for hw and level 2
+        z_ranges = torch.linspace(0.5, tpv_z-0.5, num_points_in_pillar[2]) / tpv_z # #p
+        z_ranges = z_ranges.unsqueeze(0).expand(tpv_h*tpv_w, -1) # hw, #p
+        h_ranges = torch.linspace(0.5, tpv_h-0.5, tpv_h) / tpv_h
+        h_ranges = h_ranges.reshape(-1, 1, 1).expand(-1, tpv_w, num_points_in_pillar[2]).flatten(0, 1)
+        hw_zh = torch.stack([h_ranges, z_ranges], dim=-1) # hw, #p, 2
+        # generate points for hw and level 3
+        z_ranges = torch.linspace(0.5, tpv_z-0.5, num_points_in_pillar[2]) / tpv_z # #p
+        z_ranges = z_ranges.unsqueeze(0).expand(tpv_h*tpv_w, -1) # hw, #p
+        w_ranges = torch.linspace(0.5, tpv_w-0.5, tpv_w) / tpv_w
+        w_ranges = w_ranges.reshape(1, -1, 1).expand(tpv_h, -1, num_points_in_pillar[2]).flatten(0, 1)
+        hw_wz = torch.stack([z_ranges, w_ranges], dim=-1) # hw, #p, 2
+        
+        # generate points for zh and level 1
+        w_ranges = torch.linspace(0.5, tpv_w-0.5, num_points_in_pillar[1]) / tpv_w
+        w_ranges = w_ranges.unsqueeze(0).expand(tpv_z*tpv_h, -1)
+        h_ranges = torch.linspace(0.5, tpv_h-0.5, tpv_h) / tpv_h
+        h_ranges = h_ranges.reshape(1, -1, 1).expand(tpv_z, -1, num_points_in_pillar[1]).flatten(0, 1)
+        zh_hw = torch.stack([w_ranges, h_ranges], dim=-1)
+        # generate points for zh and level 2
+        z_ranges = torch.linspace(0.5, tpv_z-0.5, tpv_z) / tpv_z
+        z_ranges = z_ranges.reshape(-1, 1, 1).expand(-1, tpv_h, num_points_in_pillar[1]).flatten(0, 1)
+        h_ranges = torch.linspace(0.5, tpv_h-0.5, tpv_h) / tpv_h
+        h_ranges = h_ranges.reshape(1, -1, 1).expand(tpv_z, -1, num_points_in_pillar[1]).flatten(0, 1)
+        zh_zh = torch.stack([h_ranges, z_ranges], dim=-1) # zh, #p, 2
+        # generate points for zh and level 3
+        w_ranges = torch.linspace(0.5, tpv_w-0.5, num_points_in_pillar[1]) / tpv_w
+        w_ranges = w_ranges.unsqueeze(0).expand(tpv_z*tpv_h, -1)
+        z_ranges = torch.linspace(0.5, tpv_z-0.5, tpv_z) / tpv_z
+        z_ranges = z_ranges.reshape(-1, 1, 1).expand(-1, tpv_h, num_points_in_pillar[1]).flatten(0, 1)
+        zh_wz = torch.stack([z_ranges, w_ranges], dim=-1)
+
+        # generate points for wz and level 1
+        h_ranges = torch.linspace(0.5, tpv_h-0.5, num_points_in_pillar[0]) / tpv_h
+        h_ranges = h_ranges.unsqueeze(0).expand(tpv_w*tpv_z, -1)
+        w_ranges = torch.linspace(0.5, tpv_w-0.5, tpv_w) / tpv_w
+        w_ranges = w_ranges.reshape(-1, 1, 1).expand(-1, tpv_z, num_points_in_pillar[0]).flatten(0, 1)
+        wz_hw = torch.stack([w_ranges, h_ranges], dim=-1)
+        # generate points for wz and level 2
+        h_ranges = torch.linspace(0.5, tpv_h-0.5, num_points_in_pillar[0]) / tpv_h
+        h_ranges = h_ranges.unsqueeze(0).expand(tpv_w*tpv_z, -1)
+        z_ranges = torch.linspace(0.5, tpv_z-0.5, tpv_z) / tpv_z
+        z_ranges = z_ranges.reshape(1, -1, 1).expand(tpv_w, -1, num_points_in_pillar[0]).flatten(0, 1)
+        wz_zh = torch.stack([h_ranges, z_ranges], dim=-1)
+        # generate points for wz and level 3
+        w_ranges = torch.linspace(0.5, tpv_w-0.5, tpv_w) / tpv_w
+        w_ranges = w_ranges.reshape(-1, 1, 1).expand(-1, tpv_z, num_points_in_pillar[0]).flatten(0, 1)
+        z_ranges = torch.linspace(0.5, tpv_z-0.5, tpv_z) / tpv_z
+        z_ranges = z_ranges.reshape(1, -1, 1).expand(tpv_w, -1, num_points_in_pillar[0]).flatten(0, 1)
+        wz_wz = torch.stack([z_ranges, w_ranges], dim=-1)
+
+        reference_points = torch.cat([
+            torch.stack([hw_hw, hw_zh, hw_wz], dim=1),
+            torch.stack([zh_hw, zh_zh, zh_wz], dim=1),
+            torch.stack([wz_hw, wz_zh, wz_wz], dim=1)
+        ], dim=0) # hw+zh+wz, 3, #p, 2
+        
+        return reference_points # hw+zh+wz, 3, #p, 2

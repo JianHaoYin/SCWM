@@ -1,21 +1,11 @@
-# SPDX-FileCopyrightText: Copyright (c) 2021-2022 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: LicenseRef-NvidiaProprietary
-#
-# NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
-# property and proprietary rights in and to this material, related
-# documentation and any modifications thereto. Any use, reproduction,
-# disclosure or distribution of this material and related documentation
-# without an express license agreement from NVIDIA CORPORATION or
-# its affiliates is strictly prohibited.
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms,models
-import models
+from image_cross_attention import ImageCrossAttention
+from crossview_hybrid_attention import CrossViewHybridAttention
 
 
-@persistence.persistent_class
 class TriPlaneGenerator(torch.nn.Module):
     def __init__(self,
         z_dim,                      # Input latent (Z) dimensionality.
@@ -108,6 +98,10 @@ class TriPlaneGenerator(torch.nn.Module):
 
 class TriPlaneModel(nn.Module):
     """
+    [0126 Simple Version].
+
+    For its forward method,  output ray-based Tri-Plane features for a specialized camera position input.
+
     Core functionality:
     1. Initialize Tri-Plane using satellite image (XY plane uses satellite features, XZ/YZ initialized to 0)
     2. Optimize Tri-Plane features by Cross-View Hybrid Attention(CVHA)
@@ -119,7 +113,9 @@ class TriPlaneModel(nn.Module):
         satellite_img: torch.Tensor,  # input satellite image [B, 3, H, W]
         plane_resolution: tuple = 224,      # Tri-Plane resolution (H, W)
         plane_channel: int = 32,      # channels per plane
+        num_of_points_in_pillar: int = 4,
         device: torch.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     ):
         super().__init__()
         self.satellite_img = satellite_img
@@ -141,9 +137,16 @@ class TriPlaneModel(nn.Module):
             nn.Softmax(dim=-1)  # 权重和为1，控制各平面更新幅度
         ).to(self.device)
         
-        # initialize Tri-Plane
-        self.tri_plane = self._init_tri_plane(satellite_img)
+        self.cross_view_hybrid_attention = CrossViewHybridAttention(
+            embed_dim=self.plane_channel,
+            num_heads=8,
+            num_levels=1,
+            num_points=4,
+            num_tpv_queue=1,
+        ).to(self.device)
 
+
+    @torch.no_grad()
     def _build_satellite_feature_extractor(self):
         resnet = models.resnet50(pretrained=True)
         # get the output of layer4
@@ -156,83 +159,62 @@ class TriPlaneModel(nn.Module):
 
     def _init_tri_plane(self, satellite_img):
         """
-        仅从卫星图初始化Tri-Plane：
-        - XY平面：卫星图的ResNet特征投影后填充
-        - XZ/YZ平面：初始化为0（后续通过update更新）
+        Get Tri-plane from a single satellite image.
         """
-        # 图片预处理（适配ResNet输入）
-        preprocess = transforms.Compose([
-            transforms.Resize((224, 224)),  # ResNet标准输入尺寸
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        img_input = preprocess(satellite_img).to(self.device)
+        satellite_img_feature_extractor = self._build_satellite_feature_extractor()
+        satellite_img_feature = satellite_img_feature_extractor(self.satellite_img)
 
-        # 提取2048维全局特征（无梯度）
-        with torch.no_grad():
-            img_feat = self.feature_extractor(img_input)  # [B, 2048, 1, 1]
-            img_feat = torch.flatten(img_feat, 1)         # [B, 2048]
-        
-        # 投影到32维，扩展为Tri-Plane分辨率
-        xy_feat = self.feature_projector(img_feat)  # [B, 32]
-        xy_feat = xy_feat.unsqueeze(-1).unsqueeze(-1)  # [B, 32, 1, 1]
-        xy_feat = xy_feat.expand(-1, self.plane_channel, self.plane_h, self.plane_w)  # [B,32,H,W]
+        tri_plane_hw = satellite_img_feature
+        tri_plane_hz = torch.zeros_like(satellite_img_feature)
+        tri_plane_wz = torch.zeros_like(satellite_img_feature)
 
-        # XZ/YZ平面初始化为0
-        xz_feat = torch.zeros_like(xy_feat)
-        yz_feat = torch.zeros_like(xy_feat)
+        cross-View_hybrid_attention = CrossViewHybridAttention(
+            embed_dim=tri_plane_hw.shape[1],
+            num_heads=8,
+            num_levels=1,
+            num_points=4,
+            num_tpv_queue=1,
+        ).to(self.device)
 
-        # 组合为Tri-Plane：[B, 3(planes), 32(ch), H, W]
-        tri_plane = torch.cat([xy_feat, xz_feat, yz_feat], dim=1)
-        tri_plane = tri_plane.view(-1, self.num_planes, self.plane_channel, self.plane_h, self.plane_w)
-        
-        # 转为可训练参数（仅用于更新，无渲染依赖）
-        return nn.Parameter(tri_plane, requires_grad=True)
+        reference_points_cvha = cross-View_hybrid_attention.get_reference_points()
 
-    def forward(self):
-        """前向传播：仅返回当前的Tri-Plane，无任何渲染/射线逻辑"""
-        return self.tri_plane
 
-    def update(self, new_img: torch.Tensor, new_cam_param: torch.Tensor, lr: float = 0.05):
+    def forward(self, satellite_img: torch.Tensor):
         """
-        仅更新Tri-Plane，不涉及任何渲染：
-        :param new_img: 新输入图片 [B, 3, H_img, W_img]
-        :param new_cam_param: 新图片的相机参数 [B, 16]（自定义维度，无渲染耦合）
-        :param lr: 更新步长，控制特征更新幅度
+        Get Tri-plane features from a satellite image.
+        :param cam_param_condition: camera parameters [B, 4, 4]
         """
-        # 1. 提取新图片的32维特征
-        preprocess = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        new_img_input = preprocess(new_img).to(self.device)
-        
-        with torch.no_grad():
-            new_img_feat = self.feature_extractor(new_img_input)
-            new_img_feat = torch.flatten(new_img_feat, 1)
-        new_plane_feat = self.feature_projector(new_img_feat)  # [B, 32]
-        new_plane_feat = new_plane_feat.unsqueeze(-1).unsqueeze(-1)
-        new_plane_feat = new_plane_feat.expand(-1, self.plane_channel, self.plane_h, self.plane_w)  # [B,32,H,W]
 
-        # 2. 编码相机参数，得到三个平面的更新权重
-        cam_weights = self.cam_encoder(new_cam_param)  # [B, 3]
+        satellite_img_feature_extractor = self._build_satellite_feature_extractor()
+        satellite_img_feature = satellite_img_feature_extractor(self.satellite_img)
 
-        # 3. 计算每个平面的更新增量（按相机权重分配新特征）
-        update_delta = torch.zeros_like(self.tri_plane)
-        for i in range(self.num_planes):
-            # 权重广播到Tri-Plane形状：[B, 1, 1, 1, 1] → [B, 1, 32, H, W]
-            weight = cam_weights[:, i].unsqueeze(1).unsqueeze(2).unsqueeze(3).unsqueeze(4)
-            update_delta[:, i, :, :, :] = weight * new_plane_feat
+        tri_plane_hw = satellite_img_feature
+        tri_plane_hz = torch.zeros_like(satellite_img_feature)
+        tri_plane_wz = torch.zeros_like(satellite_img_feature)
 
-        # 4. 无梯度更新Tri-Plane（仅参数更新，无反向传播/渲染）
-        with torch.no_grad():
-            self.tri_plane.data = self.tri_plane.data + lr * update_delta
+        reference_points_cvha = self.cross_view_hybrid_attention.get_cross_view_ref_points(tri_plane_hw, tri_plane_hz, tri_plane_wz)
 
-        # 返回更新后的Tri-Plane
-        return self.tri_plane
+        self.cross_view_hybrid_attention(tri_plane_hw, tri_plane_hz, tri_plane_wz, reference_points_cvha)
+        tri_plane = torch.stack([tri_plane_hw, tri_plane_hz, tri_plane_wz], dim=1)  # [B, 3, 32, H, W]
 
 
+        return tri_plane
 
-from training.networks_stylegan2 import FullyConnectedLayer
+class RayBasedAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads, num_levels, num_points):
+        super(RayBasedAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.num_levels = num_levels
+        self.num_points = num_points
+        # Define layers here (e.g., multi-head attention layers)
+        # This is a placeholder for the actual implementation
+
+    def forward(self, query, key, value, reference_points):
+        # Implement the attention mechanism here
+        # This is a placeholder for the actual implementation
+        attn_output = query  # Replace with actual attention output
+        return attn_output
 
 class OSGDecoder(torch.nn.Module):
     def __init__(self, n_features, options):

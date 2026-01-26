@@ -7,8 +7,6 @@ import numpy as np
 import math
 from .multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32
 
-
-
 class ImageCrossAttention(nn.Module):
     """Image cross attention module.
     Args:
@@ -28,10 +26,7 @@ class ImageCrossAttention(nn.Module):
                  dropout=0.1,
                  init_cfg=None,
                  batch_first=False,
-                 deformable_attention=dict(
-                     type='MSDeformableAttention3D',
-                     embed_dims=256,
-                     num_levels=4),
+                 deformable_attention=None,
                  tpv_h=None,
                  tpv_w=None,
                  tpv_z=None,
@@ -43,17 +38,18 @@ class ImageCrossAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.pc_range = pc_range
         self.fp16_enabled = False
-        self.deformable_attention = build_attention(deformable_attention)
+        self.deformable_attention = deformable_attention
         self.embed_dims = embed_dims
         self.num_cams = num_cams
         self.output_proj = nn.Linear(embed_dims, embed_dims)
-        self.batch_first = batch_first
         self.tpv_h, self.tpv_w, self.tpv_z = tpv_h, tpv_w, tpv_z
         self.init_weight()
 
     def init_weight(self):
         """Default initialization for Parameters of Module."""
-        xavier_init(self.output_proj, distribution='uniform', bias=0.)
+        #xavier_init(self.output_proj, distribution='uniform', bias=0.)
+        nn.init.xavier_uniform_(self.output_proj.weight)
+        nn.init.constant_(self.output_proj.bias, 0.)
 
     def forward(self,
                 query,
@@ -65,7 +61,7 @@ class ImageCrossAttention(nn.Module):
                 tpv_masks=None,
                 level_start_index=None,
                 **kwargs):
-        """Forward Function of Detr3DCrossAtten.
+        """Forward Function of ImageCrossAttention.
         Args:
             query (Tensor): Query of Transformer with shape
                 (bs, num_query, embed_dims).
@@ -86,8 +82,8 @@ class ImageCrossAttention(nn.Module):
                 or (N, Length_{query}, num_levels, 4), add
                 additional two dimensions is (w, h) to
                 form reference boxes.
-            key_padding_mask (Tensor): ByteTensor for `query`, with
-                shape [bs, num_key].
+            tpv_masks (Tensor): ByteTensor for `query`, with
+                shape [plane_index, num_cam, bs, num_query, D].
             spatial_shapes (Tensor): Spatial shape of features in
                 different level. With shape  (num_levels, 2),
                 last dimension represent (h, w).
@@ -120,6 +116,8 @@ class ImageCrossAttention(nn.Module):
         max_lens = []
         queries_rebatches = []
         reference_points_rebatches = []
+        # for each tpv plane
+        # tpv_mask for one plane: (num_cam, bs, num_query, D)
         for tpv_idx, tpv_mask in enumerate(tpv_masks):
             indexes = []
             for _, mask_per_img in enumerate(tpv_mask):
@@ -159,6 +157,7 @@ class ImageCrossAttention(nn.Module):
             spatial_shapes=spatial_shapes,
             level_start_index=level_start_index)
         
+        # aggregate the feature back to tpv slots
         for tpv_idx, indexes in enumerate(indexeses):
             for i, index_query_per_img in enumerate(indexes):
                 for j in range(bs):
@@ -168,10 +167,12 @@ class ImageCrossAttention(nn.Module):
             count = count.permute(1, 2, 0).sum(-1)
             count = torch.clamp(count, min=1.0)
             slots[tpv_idx] = slots[tpv_idx] / count[..., None]
+        # cat the feature from 3 plane
         slots = torch.cat(slots, dim=1)
+        # get the feature num by a simple MLP proj
         slots = self.output_proj(slots)
 
-        return self.dropout(slots) + inp_residual
+        return self.dropout(slots) + inp_residual #（bs, num_query, embed_dims）num_query = tpv_h*tpv_w + tpv_z*tpv_h + tpv_w*tpv_z
 
 
     @staticmethod
@@ -200,7 +201,7 @@ class ImageCrossAttention(nn.Module):
     
 
     # TODO: @force_fp32(apply_to=('reference_points', 'img_metas'))
-    def point_sampling(self, reference_points, pc_range, camera_params):
+    def point_sampling(self, reference_points, pc_range, camera_params, image_shapes):
         '''
         Sample the reference points on multi-view images.
 
@@ -208,6 +209,12 @@ class ImageCrossAttention(nn.Module):
         reference_points: (bs, D, H*W, 3) in normalized pc_range
         pc_range: [x_min, y_min, z_min, x_max, y_max, z_max]
         camera_params: (bs, num_cam, 4, 4)
+        image_shapes: (bs, num_cam, 2) list of image shapes for each camera, [(H1, W1), (H2, W2), ...]
+        TODO: actually image_shape,hw or wh?
+
+        Outputs:
+        reference_points_cam: (num_cam, bs, H*W, D, 2) in normalized image coord
+        tpv_mask: (num_cam, bs, H*W, D), bool tensor indicates whether the point is in the image frustum
         '''        
 
         # TODO: pc_range -> real world coordinate
@@ -218,7 +225,7 @@ class ImageCrossAttention(nn.Module):
         #     lidar2img.append(img_meta['lidar2img'])
         # lidar2img = np.asarray(lidar2img)
         # lidar2img = reference_points.new_tensor(lidar2img)  # (B, N, 4, 4)
-        lidar2img = camera_params # (bs, num_cam, 4, 4)
+        #camera_params # (bs, num_cam, 4, 4)
         reference_points = reference_points.clone()
 
         # convert the normalized reference points to the scale of pc_range
@@ -235,16 +242,20 @@ class ImageCrossAttention(nn.Module):
 
         #  bs,D,num_qurey,4 -> D, bs, num_query, 4
         reference_points = reference_points.permute(1, 0, 2, 3)
-        D, B, num_query = reference_points.size()[:3]
-        num_cam = lidar2img.size(1)
+        D, bs, num_query = reference_points.size()[:3]
 
+        num_cam = camera_params.size(1)
+
+
+        # reference_points shape -> (D, bs, num_cam, num_query, 4, 1)
         reference_points = reference_points.view(
-            D, B, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
+            D, bs, 1, num_query, 4).repeat(1, 1, num_cam, 1, 1).unsqueeze(-1)
+        # camera_params shape -> (D, bs, num_cam, num_query, 4, 4)
+        camera_params = camera_params.view(
+            1, bs, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
 
-        lidar2img = lidar2img.view(
-            1, B, num_cam, 1, 4, 4).repeat(D, 1, 1, num_query, 1, 1)
-
-        reference_points_cam = torch.matmul(lidar2img.to(torch.float32),
+        # reference_points_cam: (D, bs, num_cam, num_query, 4)
+        reference_points_cam = torch.matmul(camera_params.to(torch.float32),
                                             reference_points.to(torch.float32)).squeeze(-1)
         eps = 1e-5
 
@@ -252,20 +263,22 @@ class ImageCrossAttention(nn.Module):
         reference_points_cam = reference_points_cam[..., 0:2] / torch.maximum(
             reference_points_cam[..., 2:3], torch.ones_like(reference_points_cam[..., 2:3]) * eps)
         
-        reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
-        reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
+        # reference_points_cam[..., 0] /= img_metas[0]['img_shape'][0][1]
+        # reference_points_cam[..., 1] /= img_metas[0]['img_shape'][0][0]
+        #TODO: Maybe not work
+        reference_points_cam[..., 0] /= image_shapes[:, :, 1].unsqueeze(0).unsqueeze(2)
+        reference_points_cam[..., 1] /= image_shapes[:, :, 0].unsqueeze(0).unsqueeze(2)
 
         tpv_mask = (tpv_mask & (reference_points_cam[..., 1:2] > 0.0)
                     & (reference_points_cam[..., 1:2] < 1.0)
                     & (reference_points_cam[..., 0:1] < 1.0)
                     & (reference_points_cam[..., 0:1] > 0.0))
-        if digit_version(TORCH_VERSION) >= digit_version('1.8'):
-            tpv_mask = torch.nan_to_num(tpv_mask)
-        else:
-            tpv_mask = tpv_mask.new_tensor(
-                np.nan_to_num(tpv_mask.cpu().numpy()))
 
+        tpv_mask = torch.nan_to_num(tpv_mask)
+
+        # reference_points_cam: (D, bs, num_cam, num_query, 4) -> (num_cam, bs, num_query, D, 4)
         reference_points_cam = reference_points_cam.permute(2, 1, 3, 0, 4)
+        # tpv_mask: (D, bs, num_cam, num_query, 1) -> (num_cam, bs, num_query, D)
         tpv_mask = tpv_mask.permute(2, 1, 3, 0, 4).squeeze(-1)
 
         return reference_points_cam, tpv_mask
