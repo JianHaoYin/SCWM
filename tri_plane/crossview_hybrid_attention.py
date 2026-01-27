@@ -1,4 +1,4 @@
-from .multi_scale_deformable_attn_function import MultiScaleDeformableAttnFunction_fp32
+from multi_scale_deformable_attn_function import multi_scale_deform_attn_pytorch
 import warnings
 import torch
 import torch.nn as nn
@@ -42,7 +42,7 @@ class CrossViewHybridAttention(nn.Module):
                  init_cfg=None,
                  num_tpv_queue=2):
 
-        super().__init__(init_cfg)
+        super().__init__()
         if embed_dims % num_heads != 0:
             raise ValueError(f'embed_dims must be divisible by num_heads, '
                              f'but got {embed_dims} and {num_heads}')
@@ -51,6 +51,9 @@ class CrossViewHybridAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.batch_first = batch_first
         self.fp16_enabled = False
+
+        if deformable_attention is None:
+            deformable_attention = multi_scale_deform_attn_pytorch
         self.deformable_attention = deformable_attention
         # you'd better set dim_per_head to a power of 2
         # which is more efficient in the CUDA implementation
@@ -219,19 +222,19 @@ class CrossViewHybridAttention(nn.Module):
             raise ValueError(
                 f'Last dim of reference_points must be'
                 f' 2 or 4, but get {reference_points.shape[-1]} instead.')
-        if torch.cuda.is_available() and value.is_cuda:
+        # if torch.cuda.is_available() and value.is_cuda:
 
-            # using fp16 deformable attention is unstable because it performs many sum operations
-            if value.dtype == torch.float16:
-                MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
-            else:
-                MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
-            output = MultiScaleDeformableAttnFunction.apply(
-                value, spatial_shapes, level_start_index, sampling_locations,
-                attention_weights, self.im2col_step)
-        else:
-            output = self.deformable_attention(
-                value, spatial_shapes, sampling_locations, attention_weights)
+        #     # using fp16 deformable attention is unstable because it performs many sum operations
+        #     if value.dtype == torch.float16:
+        #         MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
+        #     else:
+        #         MultiScaleDeformableAttnFunction = MultiScaleDeformableAttnFunction_fp32
+        #     output = MultiScaleDeformableAttnFunction.apply(
+        #         value, spatial_shapes, level_start_index, sampling_locations,
+        #         attention_weights, self.im2col_step)
+        # else:
+        output = self.deformable_attention(
+                value, spatial_shapes, level_start_index, sampling_locations, attention_weights)
         # output shape (bs*num_tpv_queue, num_query, embed_dims)
         # (bs*num_tpv_queue, num_query, embed_dims)-> (num_query, embed_dims, bs*num_tpv_queue)
         output = output.permute(1, 2, 0)
