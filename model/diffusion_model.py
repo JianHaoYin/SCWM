@@ -1,13 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-# --------------------------------------------------------
-# References:
-# GLIDE: https://github.com/openai/glide-text2im
-# MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
-# --------------------------------------------------------
 import torch
 import torch.nn as nn
 import numpy as np
@@ -127,18 +117,20 @@ class FinalLayer(nn.Module):
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
-
-
+    
 class CDiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
+    This version supports condition feature maps whose channel != x channel
+    by using a dedicated x_cond_embedder.
     """
     def __init__(
         self,
         input_size=32,
         context_size=2,
         patch_size=2,
-        in_channels=4,
+        in_channels=4,          # channels of x (noisy target latent)
+        cond_channels=32,       # TODO: channels of x_cond (tri-plane rendered feature map)
         hidden_size=1152,
         depth=28,
         num_heads=16,
@@ -149,16 +141,34 @@ class CDiT(nn.Module):
         self.context_size = context_size
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
+        self.cond_channels = cond_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.input_size = input_size
+
+        # Patch embedding for the predicted/noisy target frame x
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+
+        # Patch embedding for condition feature maps x_cond (can have different channels)
+        self.x_cond_embedder = PatchEmbed(input_size, patch_size, cond_channels, hidden_size, bias=True)
+
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = ActionEmbedder(hidden_size)
+
         num_patches = self.x_embedder.num_patches
-        self.pos_embed = nn.Parameter(torch.zeros(self.context_size + 1, num_patches, hidden_size), requires_grad=True) # for context and for predicted frame
-        self.blocks = nn.ModuleList([CDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
+
+        # Positional embedding: first context_size slots for context tokens, last 1 slot for predicted frame tokens
+        self.pos_embed = nn.Parameter(
+            torch.zeros(self.context_size + 1, num_patches, hidden_size),
+            requires_grad=True
+        )
+
+        self.blocks = nn.ModuleList([
+            CDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+        ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+
         self.time_embedder = TimestepEmbedder(hidden_size)
         self.initialize_weights()
 
@@ -171,32 +181,28 @@ class CDiT(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
         nn.init.normal_(self.pos_embed, std=0.02)
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
-
+        for emb in [self.x_embedder, self.x_cond_embedder]:
+            w = emb.proj.weight.data
+            nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+            nn.init.constant_(emb.proj.bias, 0)
 
         # Initialize action embedding:
         nn.init.normal_(self.y_embedder.x_emb.mlp[0].weight, std=0.02)
         nn.init.normal_(self.y_embedder.x_emb.mlp[2].weight, std=0.02)
-
         nn.init.normal_(self.y_embedder.y_emb.mlp[0].weight, std=0.02)
         nn.init.normal_(self.y_embedder.y_emb.mlp[2].weight, std=0.02)
-
         nn.init.normal_(self.y_embedder.angle_emb.mlp[0].weight, std=0.02)
         nn.init.normal_(self.y_embedder.angle_emb.mlp[2].weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-        
         nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
-            
+
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
@@ -211,7 +217,7 @@ class CDiT(nn.Module):
     def unpatchify(self, x):
         """
         x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
+        imgs: (N, C, H, W)
         """
         c = self.out_channels
         p = self.x_embedder.patch_size[0]
@@ -225,24 +231,155 @@ class CDiT(nn.Module):
 
     def forward(self, x, t, y, x_cond, rel_t):
         """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
+        x:      [N, in_channels, H, W]
+        t:      [N]
+        y:      [N, 3]  (action xya in your code)
+        x_cond: [N, context_size, cond_channels, H, W]  <-- tri-plane rendered feature map repeated/stacked
+        rel_t:  [N]
         """
-        x = self.x_embedder(x) + self.pos_embed[self.context_size:]
-        x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1])) + self.pos_embed[:self.context_size]  # (N, T, D), where T = H * W / patch_size ** 2.flatten(1, 2)
-        x_cond = x_cond.flatten(1, 2)
-        t = self.t_embedder(t[..., None])
-        y = self.y_embedder(y) 
-        time_emb = self.time_embedder(rel_t[..., None])
-        c = t + time_emb + y # if training on unlabeled data, dont add y.
+        # --- sanity checks (optional but helpful) ---
+        assert x_cond.dim() == 5, "x_cond must be [N, T, C, H, W]"
+        assert x_cond.shape[1] == self.context_size, f"x_cond T must be {self.context_size}"
+        assert x.shape[-2:] == x_cond.shape[-2:], "x and x_cond must share same H,W"
 
+        # Tokens for x (predicted frame)
+        x_tok = self.x_embedder(x) + self.pos_embed[self.context_size:]           # [N, P, D]
+
+        # Tokens for x_cond (context)
+        # Flatten context into batch: [N*T, C, H, W] -> patchify -> [N*T, P, D] -> [N, T, P, D]
+        x_cond_tok = self.x_cond_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1]))
+        x_cond_tok = x_cond_tok + self.pos_embed[:self.context_size]             # [N, T, P, D]
+        x_cond_tok = x_cond_tok.flatten(1, 2)                                    # [N, T*P, D]
+
+        # Conditioning vector c
+        t_emb = self.t_embedder(t[..., None])
+        y_emb = self.y_embedder(y)
+        time_emb = self.time_embedder(rel_t[..., None])
+        c = t_emb + time_emb + y_emb
+
+        # Transformer blocks
         for block in self.blocks:
-            x = block(x, c, x_cond)
-        x = self.final_layer(x, c)
-        x = self.unpatchify(x)
-        return x
+            x_tok = block(x_tok, c, x_cond_tok)
+
+        # Output
+        x_tok = self.final_layer(x_tok, c)
+        out = self.unpatchify(x_tok)
+        return out
+
+# class CDiT(nn.Module):
+#     """
+#     Diffusion model with a Transformer backbone.
+#     """
+#     def __init__(
+#         self,
+#         input_size=32,
+#         context_size=2,
+#         patch_size=2,
+#         in_channels=4,
+#         hidden_size=1152,
+#         depth=28,
+#         num_heads=16,
+#         mlp_ratio=4.0,
+#         learn_sigma=True,
+#     ):
+#         super().__init__()
+#         self.context_size = context_size
+#         self.learn_sigma = learn_sigma
+#         self.in_channels = in_channels
+#         self.out_channels = in_channels * 2 if learn_sigma else in_channels
+#         self.patch_size = patch_size
+#         self.num_heads = num_heads
+#         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+#         self.t_embedder = TimestepEmbedder(hidden_size)
+#         self.y_embedder = ActionEmbedder(hidden_size)
+#         num_patches = self.x_embedder.num_patches
+#         self.pos_embed = nn.Parameter(torch.zeros(self.context_size + 1, num_patches, hidden_size), requires_grad=True) # for context and for predicted frame
+#         self.blocks = nn.ModuleList([CDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)])
+#         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+#         self.time_embedder = TimestepEmbedder(hidden_size)
+#         self.initialize_weights()
+
+#     def initialize_weights(self):
+#         # Initialize transformer layers:
+#         def _basic_init(module):
+#             if isinstance(module, nn.Linear):
+#                 torch.nn.init.xavier_uniform_(module.weight)
+#                 if module.bias is not None:
+#                     nn.init.constant_(module.bias, 0)
+#         self.apply(_basic_init)
+
+#         # Initialize (and freeze) pos_embed by sin-cos embedding:
+#         nn.init.normal_(self.pos_embed, std=0.02)
+
+#         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
+#         w = self.x_embedder.proj.weight.data
+#         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
+#         nn.init.constant_(self.x_embedder.proj.bias, 0)
+
+
+#         # Initialize action embedding:
+#         nn.init.normal_(self.y_embedder.x_emb.mlp[0].weight, std=0.02)
+#         nn.init.normal_(self.y_embedder.x_emb.mlp[2].weight, std=0.02)
+
+#         nn.init.normal_(self.y_embedder.y_emb.mlp[0].weight, std=0.02)
+#         nn.init.normal_(self.y_embedder.y_emb.mlp[2].weight, std=0.02)
+
+#         nn.init.normal_(self.y_embedder.angle_emb.mlp[0].weight, std=0.02)
+#         nn.init.normal_(self.y_embedder.angle_emb.mlp[2].weight, std=0.02)
+
+#         # Initialize timestep embedding MLP:
+#         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+#         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+        
+#         nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
+#         nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
+            
+#         # Zero-out adaLN modulation layers in DiT blocks:
+#         for block in self.blocks:
+#             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+#             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+#         # Zero-out output layers:
+#         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+#         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+#         nn.init.constant_(self.final_layer.linear.weight, 0)
+#         nn.init.constant_(self.final_layer.linear.bias, 0)
+
+#     def unpatchify(self, x):
+#         """
+#         x: (N, T, patch_size**2 * C)
+#         imgs: (N, H, W, C)
+#         """
+#         c = self.out_channels
+#         p = self.x_embedder.patch_size[0]
+#         h = w = int(x.shape[1] ** 0.5)
+#         assert h * w == x.shape[1]
+
+#         x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+#         x = torch.einsum('nhwpqc->nchpwq', x)
+#         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+#         return imgs
+
+#     def forward(self, x, t, y, x_cond, rel_t):
+#         """
+#         Forward pass of DiT.
+#         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
+#         t: (N,) tensor of diffusion timesteps
+#         y: (N,) tensor of class labels
+#         """
+#         x = self.x_embedder(x) + self.pos_embed[self.context_size:]
+#         x_cond = self.x_embedder(x_cond.flatten(0, 1)).unflatten(0, (x_cond.shape[0], x_cond.shape[1])) + self.pos_embed[:self.context_size]  # (N, T, D), where T = H * W / patch_size ** 2.flatten(1, 2)
+#         x_cond = x_cond.flatten(1, 2)
+#         t = self.t_embedder(t[..., None])
+#         y = self.y_embedder(y) 
+#         time_emb = self.time_embedder(rel_t[..., None])
+#         c = t + time_emb + y # if training on unlabeled data, dont add y.
+
+#         for block in self.blocks:
+#             x = block(x, c, x_cond)
+#         x = self.final_layer(x, c)
+#         x = self.unpatchify(x)
+#         return x
 
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
