@@ -1,5 +1,4 @@
-from isolated_infer import model_forward_wrapper
-
+#from isolated_infer import model_forward_wrapper
 import os
 import yaml
 import argparse
@@ -7,7 +6,6 @@ import logging
 from time import time
 from copy import deepcopy
 from collections import OrderedDict
-
 import torch
 import matplotlib
 matplotlib.use("Agg")
@@ -23,7 +21,7 @@ from misc import transform
 
 # Tri-plane condition pipeline
 from tri_plane.tri_plane_model import SatelliteToTargetFeatureModel
-
+from model.diffusion_model import TriPlaneCDiT   # 路径按你放置的位置改
 
 #################################################################################
 #                             Helper Functions                                  #
@@ -195,41 +193,16 @@ def main(args):
     num_cond = int(config["context_size"])
     cond_channels = int(config.get("cond_channels", 32))
 
-    # Diffusion model (CDiT) - MUST be the patched version supporting cond_channels
-    model = CDiT_models[config["model"]](
+
+    # 1) base CDiT (must be the new CDiT supporting cond_channels)
+    base_cdit = CDiT_models[config['model']](
         context_size=num_cond,
         input_size=latent_size,
         in_channels=4,
         cond_channels=cond_channels,
     ).to(device)
 
-    ema = deepcopy(model).to(device)
-    requires_grad(ema, False)
-    ema.eval()
-
-    # Tri-plane conditioning pipeline
-    sat2feat = SatelliteToTargetFeatureModel(
-        tri_plane_hw=tuple(config.get("tri_plane_hw", (224, 224))),
-        tri_plane_z=int(config.get("tri_plane_z", 64)),
-        tri_plane_c=cond_channels,
-        out_feat_dim=cond_channels,
-        device=device,
-    ).to(device)
-
-    # OPTIONAL: if you want to freeze tri-plane pipeline at first
-    # if int(config.get("freeze_sat2feat", 0)) == 1:
-    #     requires_grad(sat2feat, False)
-    #     sat2feat.eval()
-    #     logger.info("sat2feat is FROZEN (no gradients).")
-    # else:
-    #     sat2feat.train()
-    #     logger.info("sat2feat is TRAINABLE (gradients enabled).")
-
-    sat2feat.train()
-    logger.info("sat2feat is TRAINABLE (gradients enabled).")
-
-
-    # Render options
+    # 2) wrap with TriPlaneCDiT: sat->triplane->render inside model.forward()
     render_opts = {
         "box_warp": float(config.get("box_warp", 2.0)),
         "ray_start": float(config.get("ray_start", 0.0)),
@@ -237,42 +210,104 @@ def main(args):
         "depth_resolution": int(config.get("depth_resolution", 32)),
     }
 
+    model = TriPlaneCDiT(
+        cdit=base_cdit,
+        context_size=num_cond,
+        cond_channels=cond_channels,
+        tri_plane_hw=tuple(config.get("tri_plane_hw", (224, 224))),
+        tri_plane_z=int(config.get("tri_plane_z", 64)),
+        num_points_in_pillar=tuple(config.get("num_points_in_pillar", (4, 4, 4))),
+        render_opts=render_opts,
+        device=device,
+    ).to(device)
+
+    ema = deepcopy(model).to(device)
+    requires_grad(ema, False)
+    ema.eval()
+
+    # Train/eval modes
+    model.train()
+    ema.eval()
+
     lr = float(config.get("lr", 1e-4))
-    opt = torch.optim.AdamW(list(model.parameters()) + list(sat2feat.parameters()), lr=lr, weight_decay=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0)
 
     bfloat_enable = bool(hasattr(args, "bfloat16") and args.bfloat16)
     scaler = torch.amp.GradScaler(enabled=bfloat_enable)
 
-    # Resume checkpoint (optional)
+    # -----------------------------------------------------------------------------
+    # Resume checkpoint (TriPlaneCDiT-friendly)
+    # -----------------------------------------------------------------------------
     latest_path = os.path.join(checkpoint_dir, "latest.pth.tar")
     start_epoch = 0
     train_steps = 0
-    if os.path.isfile(latest_path) or config.get("from_checkpoint", 0):
-        latest_path = latest_path if os.path.isfile(latest_path) else config.get("from_checkpoint", 0)
-        logger.info(f"Loading checkpoint from {latest_path}")
-        ckp = torch.load(latest_path, map_location="cpu", weights_only=False)
 
+    resume_path = None
+    if os.path.isfile(latest_path):
+        resume_path = latest_path
+    elif config.get("from_checkpoint", 0):
+        resume_path = config.get("from_checkpoint", 0)
+
+    if resume_path:
+        logger.info(f"Loading checkpoint from {resume_path}")
+        ckp = torch.load(resume_path, map_location="cpu", weights_only=False)
+
+        def _strip_prefix(state_dict):
+            out = {}
+            for k, v in state_dict.items():
+                k = k.replace("_orig_mod.", "")   # torch.compile / DDP sometimes adds this
+                k = k.replace("module.", "")      # DDP adds this
+                out[k] = v
+            return out
+
+        # ---- Load model ----
         if "model" in ckp:
-            model.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in ckp["model"].items()}, strict=True)
-            ema.load_state_dict({k.replace("_orig_mod.", ""): v for k, v in ckp["ema"].items()}, strict=True)
-            logger.info("Loaded model and EMA weights.")
+            model_sd = _strip_prefix(ckp["model"])
+            missing, unexpected = model.load_state_dict(model_sd, strict=False)
+            logger.info(f"Loaded model. missing={len(missing)}, unexpected={len(unexpected)}")
+            if len(missing) > 0:
+                logger.info(f"  missing keys (show first 20): {missing[:20]}")
+            if len(unexpected) > 0:
+                logger.info(f"  unexpected keys (show first 20): {unexpected[:20]}")
         else:
+            logger.warning("Checkpoint has no 'model' key. Initializing EMA from current model.")
             update_ema(ema, model, decay=0)
 
-        if "sat2feat" in ckp:
-            sat2feat.load_state_dict(ckp["sat2feat"], strict=False)
-            logger.info("Loaded sat2feat weights (strict=False).")
+        # ---- Load EMA (preferred) ----
+        if "ema" in ckp:
+            ema_sd = _strip_prefix(ckp["ema"])
+            missing, unexpected = ema.load_state_dict(ema_sd, strict=False)
+            logger.info(f"Loaded EMA. missing={len(missing)}, unexpected={len(unexpected)}")
+            if len(missing) > 0:
+                logger.info(f"  missing EMA keys (show first 20): {missing[:20]}")
+            if len(unexpected) > 0:
+                logger.info(f"  unexpected EMA keys (show first 20): {unexpected[:20]}")
+        else:
+            logger.warning("Checkpoint has no 'ema' key. Syncing EMA from current model.")
+            update_ema(ema, model, decay=0)
 
+        # ---- Load optimizer ----
         if "opt" in ckp:
-            opt.load_state_dict(ckp["opt"])
-            logger.info("Loaded optimizer state.")
+            try:
+                opt.load_state_dict(ckp["opt"])
+                logger.info("Loaded optimizer state.")
+            except Exception as e:
+                logger.warning(f"Failed to load optimizer state: {e}")
 
+        # ---- Load epoch/steps/scaler ----
         if "epoch" in ckp:
             start_epoch = int(ckp["epoch"]) + 1
         if "train_steps" in ckp:
             train_steps = int(ckp["train_steps"])
-        if "scaler" in ckp and bfloat_enable:
-            scaler.load_state_dict(ckp["scaler"])
+
+        if bfloat_enable and ("scaler" in ckp):
+            try:
+                scaler.load_state_dict(ckp["scaler"])
+                logger.info("Loaded GradScaler state.")
+            except Exception as e:
+                logger.warning(f"Failed to load GradScaler state: {e}")
+
+        logger.info(f"Resume done: start_epoch={start_epoch}, train_steps={train_steps}")
 
     # Diffusion scheduler
     diffusion = create_diffusion(timestep_respacing="")
@@ -332,11 +367,8 @@ def main(args):
     )
     logger.info(f"Train dataset size: {len(train_dataset):,}")
 
-    # Train mode
-    model.train()
-    if int(config.get("freeze_sat2feat", 0)) != 1:
-        sat2feat.train()
-    ema.eval()
+
+
 
     log_steps = 0
     running_loss = 0.0
@@ -366,54 +398,44 @@ def main(args):
             with torch.amp.autocast("cuda", enabled=bfloat_enable, dtype=torch.bfloat16):
                 # Encode RGB frames to VAE latents (no grad)
                 with torch.no_grad():
-                    B, T = x.shape[:2]
+                    B, T = x.shape[:2]  # T should be num_cond + 1
                     x_flat = x.flatten(0, 1)
                     lat = tokenizer.encode(x_flat).latent_dist.sample().mul_(0.18215)
                     x_lat = lat.unflatten(0, (B, T))  # [B,T,4,Hlat,Wlat]
 
-                num_goals = T - num_cond
-                Hlat, Wlat = x_lat.shape[-2], x_lat.shape[-1]
+                # ---- single target frame (gt) ----
+                assert T == num_cond + 1, f"Expect T=num_cond+1, but got T={T}, num_cond={num_cond}"
+                x_start = x_lat[:, num_cond]  # [B,4,Hlat,Wlat]
+                Hlat, Wlat = x_start.shape[-2], x_start.shape[-1]
 
-                # Target latents to denoise
-                x_start = x_lat[:, num_cond:].flatten(0, 1)  # [B*num_goals,4,Hlat,Wlat]
+                # ---- y / rel_t shapes ----
+                # y expected: [B,3]
+                if y.dim() == 3:         # [B,1,3] -> [B,3]
+                    y = y.squeeze(1)
+                # rel_t expected: [B]
+                if rel_t.dim() == 2 and rel_t.shape[1] == 1:
+                    rel_t = rel_t.squeeze(1)
 
-                # Flatten y/rel_t to match B*num_goals
-                y = y.flatten(0, 1)
-                rel_t = rel_t.flatten(0, 1)
+                # ---- cam params shapes ----
+                # expected: cam2world [B,4,4], intrinsics [B,3,3]
+                # If your dataset accidentally returns [B,1,4,4] or [B,1,3,3], squeeze it.
+                if cam2world.dim() == 4 and cam2world.shape[1] == 1:
+                    cam2world = cam2world.squeeze(1)
+                if intrinsics.dim() == 4 and intrinsics.shape[1] == 1:
+                    intrinsics = intrinsics.squeeze(1)
 
-                # Prepare per-goal camera params
-                if cam2world.dim() == 5:
-                    cam2world_goal = cam2world  # [B,num_goals,4,4]
-                    intr_goal = intrinsics      # [B,num_goals,3,3]
-                else:
-                    cam2world_goal = cam2world.unsqueeze(1).expand(B, num_goals, 4, 4)
-                    intr_goal = intrinsics.unsqueeze(1).expand(B, num_goals, 3, 3)
+                # ---- diffusion timestep ----
+                t = torch.randint(0, diffusion.num_timesteps, (B,), device=device)
 
-                cam2world_goal = cam2world_goal.flatten(0, 1)
-                intr_goal = intr_goal.flatten(0, 1)
+                # ---- IMPORTANT: if you use TriPlaneCDiT wrapper, do NOT build x_cond here ----
+                model_kwargs = dict(
+                    y=y,
+                    rel_t=rel_t,
+                    sat_img=sat_img,          # [B,3,Hs,Ws]
+                    cam2world=cam2world,      # [B,4,4]
+                    intrinsics=intrinsics,    # [B,3,3]
+                )
 
-                # Expand satellite image per-goal: [B,3,Hs,Ws] -> [B*num_goals,3,Hs,Ws]
-                sat_goal = sat_img.unsqueeze(1).expand(B, num_goals, *sat_img.shape[1:]).flatten(0, 1)
-
-                # Render tri-plane feature condition at latent resolution
-                cond_feat, _ = sat2feat(
-                    satellite_img=sat_goal,
-                    cam2world=cam2world_goal,
-                    intrinsics=intr_goal,
-                    out_h=Hlat,
-                    out_w=Wlat,
-                    render_opts=render_opts,
-                    return_aux=False,
-                )  # [B*num_goals, Ccond, Hlat, Wlat]
-
-                # Repeat to match context_size expected by CDiT: [N, num_cond, Ccond, H, W]
-                x_cond = cond_feat.unsqueeze(1).repeat(1, num_cond, 1, 1, 1)
-
-                # Diffusion timestep
-                t = torch.randint(0, diffusion.num_timesteps, (x_start.shape[0],), device=device)
-
-                # Loss
-                model_kwargs = dict(y=y, x_cond=x_cond, rel_t=rel_t)
                 loss_dict = diffusion.training_losses(model, x_start, t, model_kwargs)
                 loss = loss_dict["loss"].mean()
 
@@ -447,27 +469,35 @@ def main(args):
             # Save checkpoint
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 checkpoint = {
-                    "model": model.state_dict(),
-                    "ema": ema.state_dict(),
-                    "sat2feat": sat2feat.state_dict(),
+                    "model": model.state_dict(),   # TriPlaneCDiT includes sat2feat + cdit
+                    "ema": ema.state_dict(),       # EMA of the whole TriPlaneCDiT
                     "opt": opt.state_dict(),
                     "epoch": epoch,
                     "train_steps": train_steps,
                     "args": vars(args),
+                    # (optional) keep config for reproducibility:
+                    "config": config,
                 }
                 if bfloat_enable:
                     checkpoint["scaler"] = scaler.state_dict()
+
                 ckpt_path = f"{checkpoint_dir}/latest.pth.tar"
                 torch.save(checkpoint, ckpt_path)
                 logger.info(f"Saved checkpoint to {ckpt_path}")
 
-            # Eval
-            if train_steps % args.eval_every == 0 and train_steps > 0:
-                eval_start = time()
-                save_dir = os.path.join(experiment_dir, str(train_steps))
-                sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, config, device, save_dir, bfloat_enable, num_cond)
-                eval_time = time() - eval_start
-                logger.info(f"(step={train_steps:07d}) Perceptual Loss: {sim_score:.4f}, Eval Time: {eval_time:.2f}s")
+                # (optional) keep periodic numbered snapshots
+                if train_steps % (10 * args.ckpt_every) == 0:
+                    ckpt_path2 = f"{checkpoint_dir}/{train_steps:07d}.pth.tar"
+                    torch.save(checkpoint, ckpt_path2)
+                    logger.info(f"Saved checkpoint to {ckpt_path2}")
+
+            # # Eval
+            # if train_steps % args.eval_every == 0 and train_steps > 0:
+            #     eval_start = time()
+            #     save_dir = os.path.join(experiment_dir, str(train_steps))
+            #     sim_score = evaluate(ema, tokenizer, diffusion, test_dataset, config, device, save_dir, bfloat_enable, num_cond)
+            #     eval_time = time() - eval_start
+            #     logger.info(f"(step={train_steps:07d}) Perceptual Loss: {sim_score:.4f}, Eval Time: {eval_time:.2f}s")
 
     logger.info("Done!")
 
@@ -481,7 +511,7 @@ def get_args_parser():
     parser.add_argument("--ckpt-every", type=int, default=2000)
     parser.add_argument("--eval-every", type=int, default=5000)
     parser.add_argument("--bfloat16", type=int, default=1)
-    parser.add_argument("--gpu", type=tuple, default=(4,5,6,7), help="Which CUDA device index to use")
+    parser.add_argument("--gpu", type=int, default=4, help="Which CUDA device index to use")
     return parser
 
 

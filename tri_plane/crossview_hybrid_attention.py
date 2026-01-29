@@ -1,4 +1,4 @@
-from multi_scale_deformable_attn_function import multi_scale_deform_attn_pytorch
+from tri_plane.multi_scale_deformable_attn_function import multi_scale_deform_attn_pytorch
 import warnings
 import torch
 import torch.nn as nn

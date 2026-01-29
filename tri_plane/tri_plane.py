@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms,models
-from image_cross_attention import ImageCrossAttention
-from crossview_hybrid_attention import CrossViewHybridAttention
+from tri_plane.image_cross_attention import ImageCrossAttention
+from tri_plane.crossview_hybrid_attention import CrossViewHybridAttention
 
 
 

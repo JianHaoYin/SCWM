@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
-
+from tri_plane.tri_plane_model import SatelliteToTargetFeatureModel
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -381,6 +381,122 @@ class CDiT(nn.Module):
 #         x = self.unpatchify(x)
 #         return x
 
+
+
+
+
+
+class TriPlaneCDiT(nn.Module):
+    """
+    Wrap CDiT so that x_cond can be generated internally from tri-plane rendering.
+
+    This makes training code much cleaner:
+      - Pass sat_img + cam2world + intrinsics instead of x_cond.
+      - The model renders x_cond at latent resolution HxW automatically.
+
+    Expected model_kwargs keys during training_losses():
+      - y:        [N,3]
+      - rel_t:    [N]
+      - sat_img:  [N,3,Hs,Ws]
+      - cam2world:[N,4,4]
+      - intrinsics:[N,3,3]
+      - (optional) x_cond: [N,context_size,Ccond,H,W]  overrides tri-plane conditioning
+    """
+
+    def __init__(
+        self,
+        cdit: nn.Module,
+        context_size: int,
+        cond_channels: int = 32,
+        tri_plane_hw=(224, 224),
+        tri_plane_z=64,
+        num_points_in_pillar=(4, 4, 4),
+        render_opts=None,
+        device=None,
+    ):
+        super().__init__()
+        self.cdit = cdit
+        self.context_size = context_size
+        self.cond_channels = cond_channels
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
+
+        self.sat2feat = SatelliteToTargetFeatureModel(
+            tri_plane_hw=tri_plane_hw,
+            tri_plane_z=tri_plane_z,
+            tri_plane_c=cond_channels,
+            num_points_in_pillar=num_points_in_pillar,
+            out_feat_dim=cond_channels,
+            device=device,
+        ).to(device)
+
+        if render_opts is None:
+            render_opts = dict(box_warp=2.0, ray_start=0.0, ray_end=2.0, depth_resolution=32)
+        self.render_opts = render_opts
+
+    def build_x_cond(
+        self,
+        sat_img: torch.Tensor,
+        cam2world: torch.Tensor,
+        intrinsics: torch.Tensor,
+        out_h: int,
+        out_w: int,
+    ) -> torch.Tensor:
+        """
+        Render tri-plane condition feature map, then repeat to context_size.
+        Returns x_cond: [N, context_size, Ccond, out_h, out_w]
+        """
+        cond_feat, _ = self.sat2feat(
+            satellite_img=sat_img,
+            cam2world=cam2world,
+            intrinsics=intrinsics,
+            out_h=out_h,
+            out_w=out_w,
+            render_opts=self.render_opts,
+            return_aux=False,
+        )  # [N,Ccond,H,W]
+
+        x_cond = cond_feat.unsqueeze(1).repeat(1, self.context_size, 1, 1, 1)
+        return x_cond
+
+    def forward(self, x, t, **model_kwargs):
+        """
+        This signature matches diffusion.training_losses() expectation:
+          model(x, t, **model_kwargs)
+
+        Required in model_kwargs:
+          - y, rel_t
+        And either:
+          - x_cond
+        Or:
+          - sat_img, cam2world, intrinsics
+        """
+        y = model_kwargs["y"]
+        rel_t = model_kwargs["rel_t"]
+
+        # x is [N,4,H,W] latent
+        out_h, out_w = x.shape[-2], x.shape[-1]
+
+        if "x_cond" in model_kwargs and model_kwargs["x_cond"] is not None:
+            x_cond = model_kwargs["x_cond"]
+        else:
+            sat_img = model_kwargs["sat_img"]
+            cam2world = model_kwargs["cam2world"]
+            intrinsics = model_kwargs["intrinsics"]
+
+            x_cond = self.build_x_cond(
+                sat_img=sat_img,
+                cam2world=cam2world,
+                intrinsics=intrinsics,
+                out_h=out_h,
+                out_w=out_w,
+            )
+
+        return self.cdit(x, t, y, x_cond, rel_t)
+
+
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
 #################################################################################
@@ -434,6 +550,9 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
+
+
 
 
 #################################################################################

@@ -5,7 +5,7 @@ import numpy as np
 
 
 import math
-from multi_scale_deformable_attn_function import multi_scale_deform_attn_pytorch
+from tri_plane.multi_scale_deformable_attn_function import multi_scale_deform_attn_pytorch
 
 class ImageCrossAttention(nn.Module):
     """Image cross attention module.

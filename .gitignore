@@ -1,3 +1,6 @@
 .history
 tmp_test/
 tri_plane_debug/
+data_splits/
+__pycache__/
+.DS_Store

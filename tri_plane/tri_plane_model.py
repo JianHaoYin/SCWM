@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 
 
-from tri_plane import TriPlaneModel
-from ray_based_attention import TriPlaneFeatureRenderer
+from tri_plane.tri_plane import TriPlaneModel
+from tri_plane.ray_based_attention import TriPlaneFeatureRenderer
 
 
 class SatelliteToTargetFeatureModel(nn.Module):

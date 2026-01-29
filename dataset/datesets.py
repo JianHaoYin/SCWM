@@ -8,7 +8,8 @@ import pickle
 import tqdm
 from torch.utils.data import Dataset
 from misc import angle_difference, get_data_path, get_delta_np, normalize_data, to_local_coords
-
+import json
+import torch.nn.functional as F
 class BaseDataset(Dataset):
     def __init__(
         self,
@@ -147,6 +148,58 @@ class BaseDataset(Dataset):
         
         goal_pos = np.concatenate([goal_pos, goal_yaw.reshape(-1, 1)], axis=-1)
         return actions, goal_pos    
+    def _get_meta(self, trajectory_name: str) -> dict:
+        """
+        Load meta.json for a trajectory folder.
+
+        Expected structure:
+            meta["records"][t]["camera"]["K"]    -> 3x3
+            meta["records"][t]["camera"]["T_wc"] -> 4x4 (cam-to-world)
+        """
+        meta_path = os.path.join(self.data_folder, trajectory_name, "metadata.json")
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"meta.json not found: {meta_path}")
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        return meta
+
+    def _get_camera_params(self, meta: dict, t: int):
+        """
+        Return (K, T_wc) as torch.float32 tensors.
+        K:   [3,3]
+        T_wc:[4,4]
+        """
+        rec = meta["records"][t]
+        K = torch.as_tensor(rec["camera"]["K"], dtype=torch.float32)
+        T_wc = torch.as_tensor(rec["camera"]["T_wc"], dtype=torch.float32)
+        return K, T_wc
+
+    def _get_satellite_image(self, trajectory_name: str) -> torch.Tensor:
+        """
+        Load a satellite image associated with this trajectory.
+
+        You MUST decide your actual satellite image naming.
+        Here we try a few common filenames; if none exist, we fallback to the first frame.
+        Return: [3,H,W] float tensor AFTER self.transform.
+        """
+        cand = [
+            "satellite.png", "satellite.jpg", "sat.png", "sat.jpg",
+            "map.png", "map.jpg", "overhead.png", "overhead.jpg"
+        ]
+        folder = os.path.join(self.data_folder, trajectory_name)
+        sat_path = None
+        for name in cand:
+            p = os.path.join(folder, name)
+            if os.path.isfile(p):
+                sat_path = p
+                break
+
+        if sat_path is None:
+            # Fallback: use timestep 0 frame as a placeholder (NOT ideal, but keeps pipeline running)
+            sat_path = get_data_path(self.data_folder, trajectory_name, 0)
+
+        sat_img = self.transform(Image.open(sat_path))  # [3,H,W]
+        return sat_img
 
 class TrainingDataset(BaseDataset):
     def __init__(
@@ -170,33 +223,68 @@ class TrainingDataset(BaseDataset):
             len_traj_pred, traj_stride, context_size, transform, traj_names, normalize, predefined_index, goals_per_obs)
 
 
-    def __getitem__(self, i: int) -> Tuple[torch.Tensor]:
+    def __getitem__(self, i: int):
+        """
+        Returns:
+          obs_image:   [context_size + goals_per_obs, 3, H, W]
+          goal_pos:    [goals_per_obs, 3]
+          rel_time:    [goals_per_obs]
+          sat_img:     [3, Hs, Ws]   (per-trajectory satellite image)
+          cam2world:   [goals_per_obs, 4, 4]  (T_wc for each goal frame)
+          intrinsics:  [goals_per_obs, 3, 3]  (K for each goal frame)
+        """
         try:
             f_curr, curr_time, min_goal_dist, max_goal_dist = self.index_to_data[i]
+
+            # Sample goals
             goal_offset = np.random.randint(min_goal_dist, max_goal_dist + 1, size=(self.goals_per_obs))
-            goal_time = (curr_time + goal_offset).astype('int')
-            rel_time = (goal_offset).astype('float')/(128.) # TODO: refactor, currently a fixed const
+            goal_time = (curr_time + goal_offset).astype("int")
+            rel_time = (goal_offset).astype("float") / 128.0  # keep your original normalization
 
+            # Context frames + goal frames (for x pixels)
             context_times = list(range(curr_time - self.context_size + 1, curr_time + 1))
-            context = [(f_curr, t) for t in context_times] + [(f_curr, t) for t in goal_time]
+            context = [(f_curr, t) for t in context_times] + [(f_curr, int(t)) for t in goal_time]
 
-            obs_image = torch.stack([self.transform(Image.open(get_data_path(self.data_folder, f, t))) for f, t in context])
+            obs_image = torch.stack(
+                [self.transform(Image.open(get_data_path(self.data_folder, f, t))) for f, t in context],
+                dim=0,
+            )  # [context_size + goals_per_obs, 3, H, W]
 
-            # Load other trajectory data
+            # Trajectory data for actions
             curr_traj_data = self._get_trajectory(f_curr)
 
-            # Compute actions
+            # Compute actions/goal positions
             _, goal_pos = self._compute_actions(curr_traj_data, curr_time, goal_time)
             goal_pos[:, :2] = normalize_data(goal_pos[:, :2], self.ACTION_STATS)
+
+            # --- NEW: satellite image (per trajectory) ---
+            sat_img = self._get_satellite_image(f_curr)  # [3,Hs,Ws]
+
+            # --- NEW: camera params for each goal frame (T_wc & K) ---
+            meta = self._get_meta(f_curr)
+
+            Ks = []
+            T_wcs = []
+            for gt in goal_time.tolist():
+                K, T_wc = self._get_camera_params(meta, int(gt))
+                Ks.append(K)
+                T_wcs.append(T_wc)
+
+            intrinsics = torch.stack(Ks, dim=0)  # [goals_per_obs,3,3]
+            cam2world = torch.stack(T_wcs, dim=0)  # [goals_per_obs,4,4]
 
             return (
                 torch.as_tensor(obs_image, dtype=torch.float32),
                 torch.as_tensor(goal_pos, dtype=torch.float32),
                 torch.as_tensor(rel_time, dtype=torch.float32),
+                torch.as_tensor(sat_img, dtype=torch.float32),
+                cam2world,
+                intrinsics,
             )
+
         except Exception as e:
             print(f"Exception in {self.dataset_name}", e)
-            raise Exception(e)
+            raise
 
 class EvalDataset(BaseDataset):
     def __init__(
