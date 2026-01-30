@@ -17,7 +17,7 @@ import torchvision.transforms.functional as TF
 
 IMAGE_ASPECT_RATIO = (4 / 3)  # all images are centered cropped to a 4:3 aspect ratio in training
 
-with open("config/data_config.yaml", "r") as f:
+with open("/data/tlxd/Cross-View/SCWM/config/data_config.yaml", "r") as f:
     data_config = yaml.safe_load(f)
 
 

@@ -14,9 +14,12 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, ConcatDataset
 from diffusers.models import AutoencoderKL
 
+from pathlib import Path
+ROOT = Path(__file__).resolve().parent
+
 from model.diffusion_model import CDiT_models
 from diffusion import create_diffusion
-from dataset.datesets import TrainingDataset
+from dataset.datesets import TrainingDataset,SecondFrameTrainingDataset
 from misc import transform
 
 # Tri-plane condition pipeline
@@ -168,9 +171,9 @@ def main(args):
     torch.backends.cudnn.allow_tf32 = True
 
     # Load configs
-    with open("config/eval_config.yaml", "r") as f:
+    with open(ROOT / "config" / "eval_config.yaml", "r") as f:
         config = yaml.safe_load(f)
-    with open(args.config, "r") as f:
+    with open(ROOT / args.config, "r") as f:
         user_config = yaml.safe_load(f)
     config.update(user_config)
 
@@ -332,7 +335,7 @@ def main(args):
 
             len_traj_pred = data_config.get("len_traj_pred", config["len_traj_pred"])
 
-            dataset = TrainingDataset(
+            dataset = SecondFrameTrainingDataset(
                 data_folder=data_config["data_folder"],
                 data_split_folder=data_config[split],
                 dataset_name=dataset_name,
@@ -385,6 +388,7 @@ def main(args):
                 raise ValueError(
                     "TrainingDataset must return (x, y, rel_t, sat_img, cam2world, intrinsics) to use tri-plane conditioning."
                 )
+
             x, y, rel_t, sat_img, cam2world, intrinsics = batch
 
             x = x.to(device, non_blocking=True)
@@ -399,6 +403,7 @@ def main(args):
                 # Encode RGB frames to VAE latents (no grad)
                 with torch.no_grad():
                     B, T = x.shape[:2]  # T should be num_cond + 1
+                    #two frame all in vae
                     x_flat = x.flatten(0, 1)
                     lat = tokenizer.encode(x_flat).latent_dist.sample().mul_(0.18215)
                     x_lat = lat.unflatten(0, (B, T))  # [B,T,4,Hlat,Wlat]

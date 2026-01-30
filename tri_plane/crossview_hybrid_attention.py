@@ -40,7 +40,7 @@ class CrossViewHybridAttention(nn.Module):
                  batch_first=True,
                  norm_cfg=None,
                  init_cfg=None,
-                 num_tpv_queue=2):
+                 num_tpv_queue=1):
 
         super().__init__()
         if embed_dims % num_heads != 0:
@@ -182,7 +182,7 @@ class CrossViewHybridAttention(nn.Module):
         bs,  num_query, _ = query.shape
         _, num_value, _ = value.shape
         assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
-        assert self.num_tpv_queue == 2
+        #assert self.num_tpv_queue == 2
 
         query = torch.cat([value[:bs], query], -1)
         value = self.value_proj(value)
@@ -206,6 +206,13 @@ class CrossViewHybridAttention(nn.Module):
             .reshape(bs*self.num_tpv_queue, num_query, self.num_heads, self.num_levels, self.num_points).contiguous()
         sampling_offsets = sampling_offsets.permute(3, 0, 1, 2, 4, 5, 6)\
             .reshape(bs*self.num_tpv_queue, num_query, self.num_heads, self.num_levels, self.num_points, 2)
+        
+
+        # reference_points: (bs, num_query, num_levels, 2/4)
+        # expand to match offsets batch: (bs*num_tpv_queue, num_query, num_levels, 2/4)
+        if reference_points.size(0) == bs and self.num_tpv_queue > 1:
+            reference_points = reference_points.repeat(self.num_tpv_queue, 1, 1, 1)
+
 
         if reference_points.shape[-1] == 2:
             offset_normalizer = torch.stack(
